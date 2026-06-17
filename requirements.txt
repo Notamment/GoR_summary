@@ -1,0 +1,27 @@
+# requirements.txt — pour gor_pipeline.py
+# Installation :  pip install -r requirements.txt
+#
+# ⚠️ ffmpeg n'est PAS un paquet pip : installe-le au niveau système
+#    (Windows : winget install Gyan.FFmpeg  |  Debian/Ubuntu : sudo apt install ffmpeg)
+#
+# torch/torchaudio sont tirés en build CUDA (cu124) depuis l'index PyTorch,
+# indispensable pour exploiter la RTX 2080 Ti. Sous Linux le torch PyPI est déjà
+# CUDA ; sous Windows il est CPU-only, d'où l'index ci-dessous.
+--extra-index-url https://download.pytorch.org/whl/cu124
+ 
+torch>=2.4
+torchaudio>=2.4
+ 
+# Transcription + alignement + diarisation (tire faster-whisper, ctranslate2,
+# pyannote.audio, transformers, etc. — ne pas les pinner à la main).
+whisperx>=3.1
+ 
+# Étape 1 : téléchargement audio (garde-le à jour, les sites changent souvent).
+yt-dlp
+ 
+# Étape 3 : appels à l'API Ollama.
+requests>=2.31
+
+# Barres de progression / logs.
+tqdm>=4.66
+ 
