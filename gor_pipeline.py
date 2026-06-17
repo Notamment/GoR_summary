@@ -42,6 +42,12 @@ EXEMPLES
   #   …ou en donnant simplement l'URL de la page Acast d'UNE partie :
   python gor_pipeline.py --url "https://shows.acast.com/game-of-roles-magic/episodes/game-of-roles-sheol-episode-4-13" --name sheol_e04
 
+  # CAMPAGNE ENTIÈRE : 1 dossier par épisode, .mp3 supprimés en fin d'épisode,
+  # résumé détaillé + résumé court, et reprise auto là où ça s'est arrêté :
+  python gor_pipeline.py --all --outdir sheol --min-speakers 4 --max-speakers 7
+  #   …une plage :              python gor_pipeline.py --all --from 4 --to 10 --outdir sheol
+  #   …une liste précise :      python gor_pipeline.py --episodes "4,5,6" --outdir sheol
+
   # Audio déjà là -> transcrire + résumer :
   python gor_pipeline.py --audio sheol_e02.mp3 --episode 2 --name sheol_e02
 
@@ -130,12 +136,12 @@ def _fmt_dur(sec: float) -> str:
 # ============================================================================
 # ÉTAPE 1 — Téléchargement
 # ============================================================================
-def step1_download(url: str, name: str) -> Path:
+def step1_download(url: str, name: str, outdir: Path = Path(".")) -> Path:
     import yt_dlp
     log(f"[1/3] Téléchargement audio : {url}")
     opts = {
         "format": "bestaudio/best",
-        "outtmpl": f"{name}.%(ext)s",
+        "outtmpl": str(outdir / f"{name}.%(ext)s"),
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -146,7 +152,7 @@ def step1_download(url: str, name: str) -> Path:
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
-    mp3 = Path(f"{name}.mp3")
+    mp3 = outdir / f"{name}.mp3"
     if not mp3.exists():
         raise FileNotFoundError(f"Audio introuvable après téléchargement : {mp3}")
     size = mp3.stat().st_size / 1e6
@@ -212,6 +218,21 @@ def find_acast_parts(feed_url: str, campaign: str, episode: int):
     return uniq
 
 
+def list_acast_episodes(feed_url: str, campaign: str):
+    """Liste triée des numéros d'épisodes de la campagne présents dans le flux RSS."""
+    import requests
+    xml = requests.get(feed_url, headers=_UA, timeout=60).content
+    root = ET.fromstring(xml)
+    eps = set()
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "")
+        if campaign.lower() in title.lower():
+            m = _EP_RE.search(title)
+            if m:
+                eps.add(int(m.group(1)))
+    return sorted(eps)
+
+
 def _download_file(url: str, dest: Path) -> Path:
     import requests
     with requests.get(url, headers=_UA, stream=True, timeout=120, allow_redirects=True) as r:
@@ -243,7 +264,8 @@ def _concat_audio(parts, out_path: Path) -> Path:
     return out_path
 
 
-def step1_download_acast(feed_url: str, campaign: str, episode: int, name: str) -> Path:
+def step1_download_acast(feed_url: str, campaign: str, episode: int, name: str,
+                         outdir: Path = Path(".")) -> Path:
     log(f"[1/3] Mode Acast — parties de « {campaign} Episode {episode} »")
     log(f"      Flux RSS : {feed_url}")
     meta = find_acast_parts(feed_url, campaign, episode)
@@ -261,12 +283,12 @@ def step1_download_acast(feed_url: str, campaign: str, episode: int, name: str) 
 
     files = []
     for x, yy, title, url in meta:
-        dest = Path(f"{name}_p{x}.mp3")
+        dest = outdir / f"{name}_p{x}.mp3"
         log(f"      → Partie {x}/{yy} : {title}")
         _download_file(url, dest)
         files.append(dest)
 
-    out = Path(f"{name}.mp3")
+    out = outdir / f"{name}.mp3"
     log(f"      → Collage de {len(files)} partie(s) → {out}")
     _concat_audio(files, out)
     size = out.stat().st_size / 1e6
@@ -306,6 +328,7 @@ def _load_diarizer(hf_token: str, device: str):
 
 
 def step2_transcribe(audio_path: Path, episode: int, name: str,
+                     outdir: Path = Path("."),
                      batch_size: int = 8, compute_type: str = "float16",
                      diarize: bool = True,
                      min_speakers=None, max_speakers=None) -> Path:
@@ -386,12 +409,12 @@ def step2_transcribe(audio_path: Path, episode: int, name: str,
 
     # -- 2d. Écriture : JSON brut + transcript lisible (locuteurs regroupés)
     log("      → [2d] Écriture des fichiers…")
-    json_path = Path(f"{name}.json")
+    json_path = outdir / f"{name}.json"
     json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     turns = _segments_to_turns(result.get("segments", []))
     turns = [(spk, _collapse_repeats(_apply_fixes(txt))) for spk, txt in turns]
-    txt_path = Path(f"{name}_transcript.txt")
+    txt_path = outdir / f"{name}_transcript.txt"
     txt_path.write_text("\n".join(f"[{spk}] {txt}" for spk, txt in turns), encoding="utf-8")
 
     log(f"      💾 {json_path}  (brut, avec timestamps)")
@@ -495,8 +518,8 @@ SYS = ("Tu es l'assistant d'un maître du jeu. Tu traites des extraits de l'actu
        "(perceptionner, méritomancie, dédale mental, etc.).")
 
 
-def step3_summarize(transcript_txt: Path, name: str, model="mistral-nemo",
-                    num_ctx=8192, max_chars=8000) -> Path:
+def step3_summarize(transcript_txt: Path, name: str, outdir: Path = Path("."),
+                    model="mistral-nemo", num_ctx=8192, max_chars=8000) -> Path:
     turns = _parse_transcript_txt(transcript_txt)
     chunks = _chunk_turns(turns, max_chars=max_chars)
     log(f"[3/3] Résumé via Ollama ({model}) — {len(turns)} prises de parole "
@@ -532,31 +555,105 @@ def step3_summarize(transcript_txt: Path, name: str, model="mistral-nemo",
         + "\n\n".join(f"[{i}] {p}" for i, p in enumerate(partials, 1))
     )
     final = _ollama_chat(model, SYS, user_red, num_ctx=max(num_ctx, 16384))
-    log(f"      ✅ [3-reduce] Synthèse rédigée en {_fmt_dur(time.time()-t)}.")
-
-    out = Path(f"{name}_resume.md")
+    log(f"      ✅ [3-reduce] Synthèse détaillée rédigée en {_fmt_dur(time.time()-t)}.")
+    out = outdir / f"{name}_resume.md"
     out.write_text(final, encoding="utf-8")
     log(f"      💾 {out}")
+
+    # -- COURT : version condensée 15-20 lignes, dérivée du compte rendu détaillé
+    log("      → [3-court] Résumé court (15-20 lignes)…")
+    t = time.time()
+    user_court = (
+        "Voici le compte rendu détaillé d'un épisode. Condense-le en un résumé COURT de "
+        "15 à 20 lignes maximum (≈ 150-250 mots), en PROSE continue — sans titres ni puces. "
+        "Couvre l'essentiel de ce qui s'est passé, conserve les noms propres, et n'ajoute "
+        "aucune information absente du compte rendu.\n\n"
+        "--- COMPTE RENDU DÉTAILLÉ ---\n" + final
+    )
+    court = _ollama_chat(model, SYS, user_court, num_ctx=num_ctx)
+    log(f"      ✅ [3-court] Résumé court rédigé en {_fmt_dur(time.time()-t)}.")
+    out_court = outdir / f"{name}_resume_court.md"
+    out_court.write_text(court, encoding="utf-8")
+    log(f"      💾 {out_court}")
     return out
+
+
+# ============================================================================
+# Traitement d'un épisode + boucle de campagne
+# ============================================================================
+def _delete_audio(outdir: Path):
+    """Supprime les .mp3 volumineux d'un dossier d'épisode (garde .json/.txt/.md)."""
+    freed, removed = 0, []
+    for mp3 in outdir.glob("*.mp3"):
+        try:
+            freed += mp3.stat().st_size
+            mp3.unlink()
+            removed.append(mp3.name)
+        except OSError:
+            pass
+    if removed:
+        log(f"      🧹 {len(removed)} .mp3 supprimé(s), {freed/1e6:.0f} Mo libérés.")
+
+
+def process_one_episode(episode: int, campaign: str, feed_url: str, outroot: str, args) -> str:
+    """Traite un épisode de bout en bout dans son propre dossier.
+    Renvoie 'done' ou 'skipped' ; toute exception est gérée par l'appelant."""
+    name = f"{campaign.lower()}_e{episode:02d}"
+    outdir = Path(outroot) / name
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    resume = outdir / f"{name}_resume.md"
+    if resume.exists() and not args.force:
+        log(f"⏭️  {name} : déjà traité, on saute (--force pour refaire).")
+        return "skipped"
+
+    log(f"════════ {campaign} épisode {episode} → {outdir}/ ════════")
+    audio = step1_download_acast(feed_url, campaign, episode, name, outdir=outdir)
+    transcript = step2_transcribe(
+        audio, episode, name, outdir=outdir,
+        batch_size=args.batch_size, compute_type=args.compute_type,
+        diarize=not args.no_diarize,
+        min_speakers=args.min_speakers, max_speakers=args.max_speakers,
+    )
+    step3_summarize(transcript, name, outdir=outdir, model=args.model, num_ctx=args.num_ctx)
+    if not args.keep_audio:
+        _delete_audio(outdir)
+    log(f"✅ {name} terminé.")
+    return "done"
 
 
 # ============================================================================
 # Orchestration
 # ============================================================================
 def main():
-    ap = argparse.ArgumentParser(description="Pipeline Game of Rôles : DL -> WhisperX -> résumé Ollama.")
+    ap = argparse.ArgumentParser(description="Pipeline Game of Rôles : DL -> WhisperX -> résumés Ollama.")
+    # -- source (épisode unique) --
     ap.add_argument("--url", help="Lien à télécharger (YouTube/Twitch, ou page Acast d'une partie).")
     ap.add_argument("--acast", action="store_true",
                     help="Mode Acast : retrouve toutes les parties de l'épisode et les recolle.")
-    ap.add_argument("--campaign", default=None,
-                    help="Campagne pour le mode Acast (défaut : déduit de l'URL, sinon Sheol).")
-    ap.add_argument("--acast-feed", default=None,
-                    help="Flux RSS Acast (défaut : déduit de l'URL, sinon le flux Game of Rôles).")
     ap.add_argument("--audio", help="Audio existant (saute l'étape 1).")
     ap.add_argument("--transcript", help="Transcript .txt existant (saute 1 et 2, résume seulement).")
     ap.add_argument("--name", help="Préfixe des fichiers de sortie (défaut : déduit).")
     ap.add_argument("--episode", type=int, default=0,
                     help="N° d'épisode (glossaire + recherche des parties en mode Acast).")
+    # -- mode campagne (batch) --
+    ap.add_argument("--all", action="store_true",
+                    help="Traite TOUS les épisodes de la campagne trouvés dans le flux Acast.")
+    ap.add_argument("--episodes", default=None,
+                    help='Liste d\'épisodes à traiter, ex. "4,5,6" (au lieu de --all).')
+    ap.add_argument("--from", type=int, default=None, dest="from_ep", help="Borne basse (avec --all).")
+    ap.add_argument("--to", type=int, default=None, dest="to_ep", help="Borne haute (avec --all).")
+    ap.add_argument("--outdir", default=".",
+                    help="Dossier racine ; en batch, un sous-dossier par épisode y est créé.")
+    ap.add_argument("--keep-audio", action="store_true",
+                    help="Ne pas supprimer les .mp3 en fin d'épisode.")
+    ap.add_argument("--force", action="store_true",
+                    help="Retraiter un épisode même si son résumé existe déjà.")
+    # -- communs --
+    ap.add_argument("--campaign", default=None,
+                    help="Campagne (défaut : déduit de l'URL, sinon Sheol).")
+    ap.add_argument("--acast-feed", default=None,
+                    help="Flux RSS Acast (défaut : déduit de l'URL, sinon le flux Game of Rôles).")
     ap.add_argument("--model", default="mistral-nemo", help="Modèle Ollama pour le résumé.")
     ap.add_argument("--batch-size", type=int, default=8, help="Batch WhisperX (baisser si OOM : 4).")
     ap.add_argument("--compute-type", default="float16", help="float16 (2080 Ti) ou int8 si VRAM serrée.")
@@ -566,7 +663,41 @@ def main():
     ap.add_argument("--num-ctx", type=int, default=8192, help="Contexte Ollama (12288/16384 si nécessaire).")
     args = ap.parse_args()
 
-    # Nom de base par défaut
+    # ===================== MODE CAMPAGNE (batch) =====================
+    if args.all or args.episodes or args.from_ep or args.to_ep:
+        feed = args.acast_feed or ACAST_FEED_DEFAUT
+        campaign = args.campaign or "Sheol"
+        if args.episodes:
+            eps = sorted({int(x) for x in re.split(r"[,\s]+", args.episodes.strip()) if x})
+        else:
+            log(f"Recherche des épisodes « {campaign} » dans le flux Acast…")
+            eps = list_acast_episodes(feed, campaign)
+        if args.from_ep:
+            eps = [e for e in eps if e >= args.from_ep]
+        if args.to_ep:
+            eps = [e for e in eps if e <= args.to_ep]
+        if not eps:
+            sys.exit(f"Aucun épisode « {campaign} » à traiter (flux vide ou plage hors limites).")
+        log(f"=== Batch {campaign} — {len(eps)} épisode(s) : {eps}  (sortie dans {args.outdir}/) ===")
+
+        stats = {"done": 0, "skipped": 0, "failed": 0}
+        for ep in eps:
+            try:
+                stats[process_one_episode(ep, campaign, feed, args.outdir, args)] += 1
+            except KeyboardInterrupt:
+                log("⏹️  Interrompu (Ctrl-C).")
+                break
+            except Exception as e:
+                stats["failed"] += 1
+                log(f"❌ Épisode {ep} : échec ({type(e).__name__}: {e}). On passe au suivant.")
+        log(f"=== ✅ Batch terminé en {_fmt_dur(time.time()-_T0)} — "
+            f"{stats['done']} traité(s), {stats['skipped']} sauté(s), {stats['failed']} échec(s). ===")
+        return
+
+    # ===================== MODE ÉPISODE UNIQUE =====================
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
     name = args.name
     if not name:
         src = args.transcript or args.audio or args.url or "episode"
@@ -574,13 +705,13 @@ def main():
 
     log(f"=== Pipeline Game of Rôles — sortie : « {name} » ===")
 
-    # Cas 3 : on ne fait que résumer
+    # Cas : on ne fait que résumer
     if args.transcript:
-        step3_summarize(Path(args.transcript), name, model=args.model, num_ctx=args.num_ctx)
+        step3_summarize(Path(args.transcript), name, outdir=outdir, model=args.model, num_ctx=args.num_ctx)
         log(f"=== ✅ Terminé en {_fmt_dur(time.time()-_T0)}. ===")
         return
 
-    # Étape 1 (si pas d'audio fourni)
+    # Étape 1
     if args.audio:
         audio_path = Path(args.audio)
         if not audio_path.exists():
@@ -590,7 +721,7 @@ def main():
         acast_url = bool(args.url) and "acast." in args.url.lower()
         if args.acast or acast_url:
             feed, campaign, episode = args.acast_feed, args.campaign, args.episode
-            if acast_url:                       # déduit ce qui manque depuis l'URL Acast
+            if acast_url:
                 f2, c2, e2 = acast_info_from_url(args.url)
                 feed = feed or f2
                 campaign = campaign or c2
@@ -599,25 +730,26 @@ def main():
             campaign = campaign or "Sheol"
             if not episode:
                 sys.exit("Mode Acast : précise --episode N (ou donne l'URL de la page Acast d'une partie).")
-            audio_path = step1_download_acast(feed, campaign, episode, name)
+            audio_path = step1_download_acast(feed, campaign, episode, name, outdir=outdir)
         elif args.url:
-            audio_path = step1_download(args.url, name)
+            audio_path = step1_download(args.url, name, outdir=outdir)
         else:
-            sys.exit("Fournis --url, ou --acast --episode N, ou --audio, ou --transcript.")
+            sys.exit("Fournis --url, --acast --episode N, --audio, --transcript (ou --all pour la campagne).")
 
     # Étape 2
     transcript_txt = step2_transcribe(
-        audio_path, args.episode, name,
+        audio_path, args.episode, name, outdir=outdir,
         batch_size=args.batch_size, compute_type=args.compute_type,
         diarize=not args.no_diarize,
         min_speakers=args.min_speakers, max_speakers=args.max_speakers,
     )
 
     # Étape 3
-    step3_summarize(transcript_txt, name, model=args.model, num_ctx=args.num_ctx)
+    step3_summarize(transcript_txt, name, outdir=outdir, model=args.model, num_ctx=args.num_ctx)
 
     log(f"=== ✅ Terminé en {_fmt_dur(time.time()-_T0)}. ===")
-    log(f"   Fichiers : {name}.mp3 · {name}.json · {name}_transcript.txt · {name}_resume.md")
+    log(f"   Dossier {outdir}/ : {name}.json · {name}_transcript.txt · "
+        f"{name}_resume.md · {name}_resume_court.md")
 
 
 if __name__ == "__main__":
